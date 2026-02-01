@@ -19,6 +19,8 @@ CONFIG_PATH = Path("/data/options.json")
 
 # Preferred models in order (best first)
 PREFERRED_MODELS = [
+    "gemini-3-pro",
+    "gemini-3-flash",
     "gemini-2.5-pro",
     "gemini-2.0-pro",
     "gemini-2.0-flash",
