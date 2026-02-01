@@ -17,15 +17,16 @@ sys.stdout.reconfigure(line_buffering=True)
 
 CONFIG_PATH = Path("/data/options.json")
 
-# Preferred models in order (best first)
+# Preferred models in order (flash models first - higher free tier limits)
 PREFERRED_MODELS = [
-    "gemini-3-pro",
     "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-3-pro",
     "gemini-2.5-pro",
     "gemini-2.0-pro",
-    "gemini-2.0-flash",
     "gemini-1.5-pro",
-    "gemini-1.5-flash",
     "gemini-pro",
 ]
 
@@ -119,31 +120,42 @@ def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
     return buffer.tobytes()
 
 
-def analyze_gate(client: genai.Client, model_name: str, image_data: bytes) -> str:
+def analyze_gate(client: genai.Client, model_name: str, image_data: bytes, max_retries: int = 3) -> str:
     """Send image to Gemini Vision and get gate status."""
     log("vision", f"Analyzing image with {model_name}...")
 
-    try:
-        # Convert bytes to PIL Image for Gemini
-        image = Image.open(io.BytesIO(image_data))
+    # Convert bytes to PIL Image for Gemini
+    image = Image.open(io.BytesIO(image_data))
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=[VISION_PROMPT, image],
-        )
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[VISION_PROMPT, image],
+            )
 
-        result = response.text.strip().upper()
-        log("vision", f"Gemini response: {result}")
+            result = response.text.strip().upper()
+            log("vision", f"Gemini response: {result}")
 
-        if result in ("OPEN", "CLOSED", "UNKNOWN"):
-            return result.lower()
+            if result in ("OPEN", "CLOSED", "UNKNOWN"):
+                return result.lower()
 
-        log("vision", "Unexpected response, treating as unknown")
-        return "unknown"
+            log("vision", "Unexpected response, treating as unknown")
+            return "unknown"
 
-    except Exception as e:
-        log("vision", f"ERROR: API call failed: {e}")
-        return "error"
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                # Rate limited - wait and retry
+                wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s
+                log("vision", f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
+            else:
+                log("vision", f"ERROR: API call failed: {e}")
+                return "error"
+
+    log("vision", "ERROR: Max retries exceeded due to rate limiting")
+    return "error"
 
 
 def create_mqtt_client(config: dict) -> mqtt.Client:
