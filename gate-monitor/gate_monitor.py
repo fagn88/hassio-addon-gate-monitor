@@ -17,7 +17,7 @@ import io
 sys.stdout.reconfigure(line_buffering=True)
 
 CONFIG_PATH = Path("/data/options.json")
-SNAPSHOT_DIR = Path("/media/gate-monitor")
+SNAPSHOT_DIR = Path("/config/www/gate-monitor")
 
 # Preferred models in order (flash models first - higher free tier limits)
 PREFERRED_MODELS = [
@@ -141,8 +141,9 @@ def save_snapshot(image_data: bytes, camera_name: str) -> str | None:
 
         log("snapshot", f"Saved snapshot to {snapshot_path}")
 
-        # Return path relative to /media for HA access
-        return f"/media/gate-monitor/{camera_name}_latest.jpg"
+        # Return /local/ path for HA notifications (maps to /config/www/)
+        timestamp_url = int(datetime.now().timestamp())
+        return f"/local/gate-monitor/{camera_name}_latest.jpg?v={timestamp_url}"
 
     except Exception as e:
         log("snapshot", f"ERROR saving snapshot: {e}")

@@ -1,6 +1,6 @@
 name: "Gate Monitor"
 description: "Monitor gate status using Gemini Vision API"
-version: "1.0.8"
+version: "1.0.9"
 slug: "gate-monitor"
 init: false
 arch:
@@ -12,7 +12,7 @@ arch:
 startup: application
 boot: auto
 map:
-  - media:rw
+  - config:rw
 options:
   camera_name: "exterior_frente"
   rtsp_url: ""
