@@ -32,16 +32,23 @@ PREFERRED_MODELS = [
     "gemini-pro",
 ]
 
-VISION_PROMPT = """Analisa esta imagem de uma câmara de segurança exterior.
+VISION_PROMPT = """Esta imagem mostra um portão metálico de grades verticais.
 
-LOCALIZAÇÃO DO PORTÃO: O portão da rua está na zona SUPERIOR ESQUERDA da imagem. É um portão metálico/gradeado.
+COMO IDENTIFICAR O ESTADO:
+- OPEN (aberto): O portão está rodado/inclinado para dentro, afastado da posição vertical. Vês um ângulo ou abertura.
+- CLOSED (fechado): O portão está na posição vertical, paralelo ao muro/vedação, com as grades alinhadas verticalmente.
 
-COMO IDENTIFICAR:
-- OPEN (aberto): O portão está afastado da posição normal, rodado para dentro, ou consegues ver claramente através da abertura onde normalmente estaria fechado
-- CLOSED (fechado): O portão está na posição vertical, alinhado com a vedação/muro, bloqueando a passagem
+Olha para a orientação das grades metálicas do portão.
+Responde APENAS: OPEN, CLOSED ou UNKNOWN"""
 
-Responde APENAS com uma palavra: OPEN, CLOSED ou UNKNOWN
-Sem explicação adicional."""
+# Gate region crop coordinates (percentage of frame)
+# Based on camera view: gate is in upper-left corner
+GATE_CROP = {
+    "x_start": 0.0,    # 0% from left
+    "x_end": 0.25,     # 25% from left
+    "y_start": 0.10,   # 10% from top
+    "y_end": 0.55,     # 55% from top
+}
 
 
 def log(module: str, message: str) -> None:
@@ -99,29 +106,44 @@ def find_best_model(client: genai.Client) -> str | None:
     return None
 
 
-def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
-    """Capture a single frame from RTSP stream."""
+def capture_rtsp_frame(rtsp_url: str) -> tuple[bytes, bytes] | tuple[None, None]:
+    """Capture a single frame from RTSP stream.
+
+    Returns:
+        Tuple of (full_frame_bytes, cropped_gate_bytes) or (None, None) on error
+    """
     log("camera", "Capturing frame from camera...")
 
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
         log("camera", "ERROR: Failed to open RTSP stream")
-        return None
+        return None, None
 
     ret, frame = cap.read()
     cap.release()
 
     if not ret:
         log("camera", "ERROR: Failed to capture frame")
-        return None
+        return None, None
 
-    # Resize to reduce tokens (640x480 is sufficient)
+    # Resize full frame
     frame = cv2.resize(frame, (640, 480))
+    height, width = frame.shape[:2]
 
-    # Encode to JPEG
-    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    log("camera", "Frame captured successfully")
-    return buffer.tobytes()
+    # Encode full frame for snapshot
+    _, full_buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+    # Crop to gate region for analysis
+    x1 = int(width * GATE_CROP["x_start"])
+    x2 = int(width * GATE_CROP["x_end"])
+    y1 = int(height * GATE_CROP["y_start"])
+    y2 = int(height * GATE_CROP["y_end"])
+
+    cropped = frame[y1:y2, x1:x2]
+    _, crop_buffer = cv2.imencode('.jpg', cropped, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+    log("camera", f"Frame captured: full 640x480, gate crop {x2-x1}x{y2-y1}")
+    return full_buffer.tobytes(), crop_buffer.tobytes()
 
 
 def save_snapshot(image_data: bytes, camera_name: str) -> str | None:
@@ -292,12 +314,12 @@ def main() -> None:
         while True:
             log("main", "Starting gate check...")
 
-            # Capture frame
-            image_data = capture_rtsp_frame(rtsp_url)
+            # Capture frame (full for snapshot, cropped for analysis)
+            full_frame, gate_crop = capture_rtsp_frame(rtsp_url)
 
-            if image_data:
-                # Analyze with Gemini Vision
-                status = analyze_gate(gemini_client, model_name, image_data)
+            if full_frame and gate_crop:
+                # Analyze cropped gate region with Gemini Vision
+                status = analyze_gate(gemini_client, model_name, gate_crop)
 
                 if status != "error":
                     # Publish status
@@ -305,8 +327,8 @@ def main() -> None:
 
                     # Send alert if gate is open
                     if status == "open":
-                        # Save snapshot for notification
-                        snapshot_path = save_snapshot(image_data, camera_name)
+                        # Save full snapshot for notification
+                        snapshot_path = save_snapshot(full_frame, camera_name)
                         publish_alert(mqtt_client, topic_prefix, camera_name, snapshot_path)
                         log("main", "GATE IS OPEN - Alert sent with snapshot")
                     else:
