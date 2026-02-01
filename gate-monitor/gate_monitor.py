@@ -9,7 +9,6 @@ from pathlib import Path
 import cv2
 import paho.mqtt.client as mqtt
 from google import genai
-from google.genai import types
 from PIL import Image
 import io
 
@@ -17,6 +16,16 @@ import io
 sys.stdout.reconfigure(line_buffering=True)
 
 CONFIG_PATH = Path("/data/options.json")
+
+# Preferred models in order (best first)
+PREFERRED_MODELS = [
+    "gemini-2.5-pro",
+    "gemini-2.0-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+    "gemini-pro",
+]
 
 VISION_PROMPT = """Analisa esta imagem de uma câmara de segurança exterior.
 O portão da rua está visível na imagem.
@@ -40,6 +49,47 @@ def load_config() -> dict:
             return json.load(f)
     log("config", "Config file not found, using defaults")
     return {}
+
+
+def find_best_model(client: genai.Client) -> str | None:
+    """List available models and return the best one for vision tasks."""
+    log("models", "Listing available Gemini models...")
+
+    available_models = []
+    try:
+        for model in client.models.list():
+            model_name = model.name
+            # Strip "models/" prefix if present
+            if model_name.startswith("models/"):
+                model_name = model_name[7:]
+
+            if "gemini" in model_name.lower():
+                available_models.append(model_name)
+                log("models", f"  Found: {model_name}")
+    except Exception as e:
+        log("models", f"ERROR listing models: {e}")
+        return None
+
+    # Find the best available model from our preference list
+    for preferred in PREFERRED_MODELS:
+        for available in available_models:
+            # Check if the preferred model matches (with or without version suffix)
+            if available.startswith(preferred) or available == preferred:
+                log("models", f"Selected model: {available}")
+                return available
+
+    # If none of our preferred models found, try the first gemini model
+    for available in available_models:
+        if "gemini" in available.lower() and "pro" in available.lower():
+            log("models", f"Fallback model: {available}")
+            return available
+
+    if available_models:
+        log("models", f"Using first available: {available_models[0]}")
+        return available_models[0]
+
+    log("models", "ERROR: No Gemini models found!")
+    return None
 
 
 def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
@@ -67,16 +117,16 @@ def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
     return buffer.tobytes()
 
 
-def analyze_gate(client: genai.Client, image_data: bytes) -> str:
+def analyze_gate(client: genai.Client, model_name: str, image_data: bytes) -> str:
     """Send image to Gemini Vision and get gate status."""
-    log("vision", "Analyzing image with Gemini Vision...")
+    log("vision", f"Analyzing image with {model_name}...")
 
     try:
         # Convert bytes to PIL Image for Gemini
         image = Image.open(io.BytesIO(image_data))
 
         response = client.models.generate_content(
-            model="gemini-1.5-pro",
+            model=model_name,
             contents=[VISION_PROMPT, image],
         )
 
@@ -165,7 +215,14 @@ def main() -> None:
 
     # Initialize Gemini client
     gemini_client = genai.Client(api_key=api_key)
-    log("main", "Gemini Vision initialized")
+
+    # Find the best available model
+    model_name = find_best_model(gemini_client)
+    if not model_name:
+        log("main", "ERROR: Could not find a suitable Gemini model")
+        sys.exit(1)
+
+    log("main", f"Using model: {model_name}")
 
     # Initialize MQTT
     mqtt_client = create_mqtt_client(config)
@@ -185,7 +242,7 @@ def main() -> None:
 
             if image_data:
                 # Analyze with Gemini Vision
-                status = analyze_gate(gemini_client, image_data)
+                status = analyze_gate(gemini_client, model_name, image_data)
 
                 if status != "error":
                     # Publish status
