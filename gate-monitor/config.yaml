@@ -1,6 +1,6 @@
 name: "Gate Monitor"
-description: "Monitor gate status using Claude Vision API"
-version: "1.0.7"
+description: "Monitor gate status using Gemini Vision API"
+version: "1.0.8"
 slug: "gate-monitor"
 init: false
 arch:
@@ -11,6 +11,8 @@ arch:
   - i386
 startup: application
 boot: auto
+map:
+  - media:rw
 options:
   camera_name: "exterior_frente"
   rtsp_url: ""

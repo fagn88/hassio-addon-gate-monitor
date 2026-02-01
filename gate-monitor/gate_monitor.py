@@ -4,6 +4,7 @@
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -16,6 +17,7 @@ import io
 sys.stdout.reconfigure(line_buffering=True)
 
 CONFIG_PATH = Path("/data/options.json")
+SNAPSHOT_DIR = Path("/media/gate-monitor")
 
 # Preferred models in order (flash models first - higher free tier limits)
 PREFERRED_MODELS = [
@@ -120,6 +122,33 @@ def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
     return buffer.tobytes()
 
 
+def save_snapshot(image_data: bytes, camera_name: str) -> str | None:
+    """Save snapshot to /media/gate-monitor/ and return the path."""
+    try:
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Save with timestamp for history
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot_path = SNAPSHOT_DIR / f"{camera_name}_{timestamp}.jpg"
+
+        with open(snapshot_path, "wb") as f:
+            f.write(image_data)
+
+        # Also save as "latest" for easy access
+        latest_path = SNAPSHOT_DIR / f"{camera_name}_latest.jpg"
+        with open(latest_path, "wb") as f:
+            f.write(image_data)
+
+        log("snapshot", f"Saved snapshot to {snapshot_path}")
+
+        # Return path relative to /media for HA access
+        return f"/media/gate-monitor/{camera_name}_latest.jpg"
+
+    except Exception as e:
+        log("snapshot", f"ERROR saving snapshot: {e}")
+        return None
+
+
 def analyze_gate(client: genai.Client, model_name: str, image_data: bytes, max_retries: int = 3) -> str:
     """Send image to Gemini Vision and get gate status."""
     log("vision", f"Analyzing image with {model_name}...")
@@ -189,11 +218,20 @@ def publish_status(client: mqtt.Client, topic_prefix: str, camera_name: str, sta
     log("mqtt", f"Published to {topic}: {status}")
 
 
-def publish_alert(client: mqtt.Client, topic_prefix: str, camera_name: str) -> None:
-    """Publish gate open alert to MQTT."""
+def publish_alert(client: mqtt.Client, topic_prefix: str, camera_name: str, snapshot_path: str | None) -> None:
+    """Publish gate open alert to MQTT with snapshot path."""
     topic = f"{topic_prefix}/{camera_name}/alert"
-    client.publish(topic, "gate_open")
-    log("mqtt", f"Published alert to {topic}")
+
+    # Send JSON payload with snapshot path
+    payload = {
+        "event": "gate_open",
+        "camera": camera_name,
+        "timestamp": datetime.now().isoformat(),
+        "snapshot": snapshot_path,
+    }
+
+    client.publish(topic, json.dumps(payload))
+    log("mqtt", f"Published alert to {topic} with snapshot: {snapshot_path}")
 
 
 def publish_addon_status(client: mqtt.Client, topic_prefix: str, status: str) -> None:
@@ -264,8 +302,10 @@ def main() -> None:
 
                     # Send alert if gate is open
                     if status == "open":
-                        publish_alert(mqtt_client, topic_prefix, camera_name)
-                        log("main", "GATE IS OPEN - Alert sent")
+                        # Save snapshot for notification
+                        snapshot_path = save_snapshot(image_data, camera_name)
+                        publish_alert(mqtt_client, topic_prefix, camera_name, snapshot_path)
+                        log("main", "GATE IS OPEN - Alert sent with snapshot")
                     else:
                         log("main", f"Gate status: {status}")
             else:
