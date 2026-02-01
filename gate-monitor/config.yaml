@@ -1,6 +1,6 @@
 name: "Gate Monitor"
 description: "Monitor gate status using Gemini Vision API"
-version: "1.0.9"
+version: "1.0.10"
 slug: "gate-monitor"
 init: false
 arch:

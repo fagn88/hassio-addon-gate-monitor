@@ -33,13 +33,15 @@ PREFERRED_MODELS = [
 ]
 
 VISION_PROMPT = """Analisa esta imagem de uma câmara de segurança exterior.
-O portão da rua está visível na imagem.
-Responde APENAS com uma palavra:
-- "OPEN" se o portão estiver aberto (consegues ver através dele ou está afastado da posição fechada)
-- "CLOSED" se o portão estiver fechado (na posição normal fechada)
-- "UNKNOWN" se não conseguires determinar
 
-Responde apenas com a palavra, sem explicação."""
+LOCALIZAÇÃO DO PORTÃO: O portão da rua está na zona SUPERIOR ESQUERDA da imagem. É um portão metálico/gradeado.
+
+COMO IDENTIFICAR:
+- OPEN (aberto): O portão está afastado da posição normal, rodado para dentro, ou consegues ver claramente através da abertura onde normalmente estaria fechado
+- CLOSED (fechado): O portão está na posição vertical, alinhado com a vedação/muro, bloqueando a passagem
+
+Responde APENAS com uma palavra: OPEN, CLOSED ou UNKNOWN
+Sem explicação adicional."""
 
 
 def log(module: str, message: str) -> None:
