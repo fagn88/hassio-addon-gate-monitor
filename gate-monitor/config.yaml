@@ -1,6 +1,6 @@
 name: "Gate Monitor"
 description: "Monitor gate status using Claude Vision API"
-version: "1.0.2"
+version: "1.0.3"
 slug: "gate-monitor"
 init: false
 arch:

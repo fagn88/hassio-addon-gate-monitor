@@ -7,8 +7,9 @@ import time
 from pathlib import Path
 
 import cv2
-import google.generativeai as genai
 import paho.mqtt.client as mqtt
+from google import genai
+from google.genai import types
 from PIL import Image
 import io
 
@@ -66,7 +67,7 @@ def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
     return buffer.tobytes()
 
 
-def analyze_gate(model, image_data: bytes) -> str:
+def analyze_gate(client: genai.Client, image_data: bytes) -> str:
     """Send image to Gemini Vision and get gate status."""
     log("vision", "Analyzing image with Gemini Vision...")
 
@@ -74,7 +75,10 @@ def analyze_gate(model, image_data: bytes) -> str:
         # Convert bytes to PIL Image for Gemini
         image = Image.open(io.BytesIO(image_data))
 
-        response = model.generate_content([VISION_PROMPT, image])
+        response = client.models.generate_content(
+            model="gemini-2.5-pro-preview-05-06",
+            contents=[VISION_PROMPT, image],
+        )
 
         result = response.text.strip().upper()
         log("vision", f"Gemini response: {result}")
@@ -159,9 +163,8 @@ def main() -> None:
     log("main", f"Camera: {camera_name}")
     log("main", f"Check interval: {check_interval // 60} minutes")
 
-    # Initialize Gemini
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Initialize Gemini client
+    gemini_client = genai.Client(api_key=api_key)
     log("main", "Gemini Vision initialized")
 
     # Initialize MQTT
@@ -182,7 +185,7 @@ def main() -> None:
 
             if image_data:
                 # Analyze with Gemini Vision
-                status = analyze_gate(model, image_data)
+                status = analyze_gate(gemini_client, image_data)
 
                 if status != "error":
                     # Publish status
