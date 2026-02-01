@@ -76,7 +76,7 @@ def analyze_gate(client: genai.Client, image_data: bytes) -> str:
         image = Image.open(io.BytesIO(image_data))
 
         response = client.models.generate_content(
-            model="gemini-2.5-pro-preview-05-06",
+            model="gemini-1.5-pro",
             contents=[VISION_PROMPT, image],
         )
 
