@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Gate Monitor service
+# ==============================================================================
+
+bashio::log.info "Starting Gate Monitor..."
+
+exec python3 -u /app/gate_monitor.py
