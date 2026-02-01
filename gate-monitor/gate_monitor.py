@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Gate Monitor - Detect gate status using Claude Vision API."""
+"""Gate Monitor - Detect gate status using Gemini Vision API."""
 
-import base64
 import json
 import sys
 import time
 from pathlib import Path
 
-import anthropic
 import cv2
+import google.generativeai as genai
 import paho.mqtt.client as mqtt
+from PIL import Image
+import io
 
 # Enable unbuffered output for real-time logging
 sys.stdout.reconfigure(line_buffering=True)
@@ -42,7 +43,7 @@ def load_config() -> dict:
 
 def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
     """Capture a single frame from RTSP stream."""
-    log("camera", f"Capturing frame from camera...")
+    log("camera", "Capturing frame from camera...")
 
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
@@ -65,47 +66,26 @@ def capture_rtsp_frame(rtsp_url: str) -> bytes | None:
     return buffer.tobytes()
 
 
-def analyze_gate(client: anthropic.Anthropic, image_data: bytes) -> str:
-    """Send image to Claude Vision and get gate status."""
-    log("vision", "Analyzing image with Claude Vision...")
-
-    image_b64 = base64.standard_b64encode(image_data).decode("utf-8")
+def analyze_gate(model, image_data: bytes) -> str:
+    """Send image to Gemini Vision and get gate status."""
+    log("vision", "Analyzing image with Gemini Vision...")
 
     try:
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=10,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": VISION_PROMPT,
-                        },
-                    ],
-                }
-            ],
-        )
+        # Convert bytes to PIL Image for Gemini
+        image = Image.open(io.BytesIO(image_data))
 
-        response = message.content[0].text.strip().upper()
-        log("vision", f"Claude response: {response}")
+        response = model.generate_content([VISION_PROMPT, image])
 
-        if response in ("OPEN", "CLOSED", "UNKNOWN"):
-            return response.lower()
+        result = response.text.strip().upper()
+        log("vision", f"Gemini response: {result}")
 
-        log("vision", f"Unexpected response, treating as unknown")
+        if result in ("OPEN", "CLOSED", "UNKNOWN"):
+            return result.lower()
+
+        log("vision", "Unexpected response, treating as unknown")
         return "unknown"
 
-    except anthropic.APIError as e:
+    except Exception as e:
         log("vision", f"ERROR: API call failed: {e}")
         return "error"
 
@@ -167,9 +147,9 @@ def main() -> None:
         log("main", "ERROR: rtsp_url not configured")
         sys.exit(1)
 
-    api_key = config.get("anthropic_api_key", "")
+    api_key = config.get("gemini_api_key", "")
     if not api_key:
-        log("main", "ERROR: anthropic_api_key not configured")
+        log("main", "ERROR: gemini_api_key not configured")
         sys.exit(1)
 
     camera_name = config.get("camera_name", "exterior_frente")
@@ -179,8 +159,12 @@ def main() -> None:
     log("main", f"Camera: {camera_name}")
     log("main", f"Check interval: {check_interval // 60} minutes")
 
-    # Initialize clients
-    anthropic_client = anthropic.Anthropic(api_key=api_key)
+    # Initialize Gemini
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    log("main", "Gemini Vision initialized")
+
+    # Initialize MQTT
     mqtt_client = create_mqtt_client(config)
 
     # Publish online status
@@ -197,8 +181,8 @@ def main() -> None:
             image_data = capture_rtsp_frame(rtsp_url)
 
             if image_data:
-                # Analyze with Claude Vision
-                status = analyze_gate(anthropic_client, image_data)
+                # Analyze with Gemini Vision
+                status = analyze_gate(model, image_data)
 
                 if status != "error":
                     # Publish status
@@ -207,7 +191,7 @@ def main() -> None:
                     # Send alert if gate is open
                     if status == "open":
                         publish_alert(mqtt_client, topic_prefix, camera_name)
-                        log("main", "⚠️ GATE IS OPEN - Alert sent")
+                        log("main", "GATE IS OPEN - Alert sent")
                     else:
                         log("main", f"Gate status: {status}")
             else:

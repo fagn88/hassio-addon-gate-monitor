@@ -1,6 +1,6 @@
 name: "Gate Monitor"
 description: "Monitor gate status using Claude Vision API"
-version: "1.0.1"
+version: "1.0.2"
 slug: "gate-monitor"
 init: false
 arch:
@@ -15,7 +15,7 @@ options:
   camera_name: "exterior_frente"
   rtsp_url: ""
   check_interval_minutes: 30
-  anthropic_api_key: ""
+  gemini_api_key: ""
   mqtt_broker: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
@@ -25,7 +25,7 @@ schema:
   camera_name: str
   rtsp_url: url
   check_interval_minutes: int(1,1440)
-  anthropic_api_key: password
+  gemini_api_key: password
   mqtt_broker: str
   mqtt_port: port
   mqtt_username: str
