@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.0] - 2026-02-07
+
+### Added
+- **Few-shot reference images**: Load labeled reference images from `/config/www/gate-monitor/reference/` for visual comparison (supports `closed_day.jpg`, `closed_night.jpg`, `open_day.jpg`, `open_night.jpg`)
+- **Confidence scoring**: Gemini now returns a confidence score (0-100) with each classification
+- **Confidence threshold**: New `confidence_threshold` config option (default: 70) - detections below threshold are treated as UNKNOWN
+- **Confirmation re-check**: When gate is detected as OPEN, automatically captures a second frame after 15 seconds and re-analyzes to eliminate false positives
+- **Structured JSON responses**: Prompt now requests JSON output for reliable parsing with multiple fallback strategies
+
+### Changed
+- Improved vision prompt with explicit comparison instructions for reference images
+- Set Gemini `temperature=0.0` for deterministic, consistent responses
+- `analyze_gate()` now returns `(status, confidence)` tuple instead of just status
+- Graceful degradation: works in zero-shot mode when no reference images are present
+
 ## [1.0.11] - 2026-02-01
 
 ### Added

@@ -2,6 +2,7 @@
 """Gate Monitor - Detect gate status using Gemini Vision API."""
 
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -10,6 +11,7 @@ from pathlib import Path
 import cv2
 import paho.mqtt.client as mqtt
 from google import genai
+from google.genai import types
 from PIL import Image
 import io
 
@@ -18,6 +20,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 CONFIG_PATH = Path("/data/options.json")
 SNAPSHOT_DIR = Path("/config/www/gate-monitor")
+REFERENCE_DIR = Path("/config/www/gate-monitor/reference")
 
 # Preferred models in order (flash models first - higher free tier limits)
 PREFERRED_MODELS = [
@@ -32,14 +35,30 @@ PREFERRED_MODELS = [
     "gemini-pro",
 ]
 
-VISION_PROMPT = """Esta imagem mostra um portão metálico de grades verticais.
+VISION_PROMPT_WITH_REFS = """You are a gate status classifier. Your task is to determine if a gate is OPEN or CLOSED by comparing the query image against the reference examples provided.
 
-COMO IDENTIFICAR O ESTADO:
-- OPEN (aberto): O portão está rodado/inclinado para dentro, afastado da posição vertical. Vês um ângulo ou abertura.
-- CLOSED (fechado): O portão está na posição vertical, paralelo ao muro/vedação, com as grades alinhadas verticalmente.
+INSTRUCTIONS:
+- Compare the query image carefully against the labeled reference images
+- CLOSED: The gate is upright and aligned with the fence/wall, bars are vertical
+- OPEN: The gate is rotated/swung inward, creating an angle or gap
+- If unsure, respond UNKNOWN with low confidence
 
-Olha para a orientação das grades metálicas do portão.
-Responde APENAS: OPEN, CLOSED ou UNKNOWN"""
+Respond ONLY with valid JSON (no markdown, no extra text):
+{"status": "OPEN", "confidence": 85}
+{"status": "CLOSED", "confidence": 95}
+{"status": "UNKNOWN", "confidence": 30}"""
+
+VISION_PROMPT_NO_REFS = """You are a gate status classifier analyzing a cropped image of a metal bar gate.
+
+INSTRUCTIONS:
+- CLOSED: The gate is upright, vertical bars aligned with the fence/wall
+- OPEN: The gate is rotated/swung inward, creating an angle or visible gap
+- If unsure, respond UNKNOWN with low confidence
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{"status": "OPEN", "confidence": 85}
+{"status": "CLOSED", "confidence": 95}
+{"status": "UNKNOWN", "confidence": 30}"""
 
 # Gate region crop coordinates (percentage of frame)
 # Based on camera view: gate is in upper-left corner
@@ -49,6 +68,17 @@ GATE_CROP = {
     "y_start": 0.10,   # 10% from top
     "y_end": 0.55,     # 55% from top
 }
+
+# Reference image filenames to look for
+REFERENCE_FILENAMES = [
+    "closed_day.jpg",
+    "closed_night.jpg",
+    "open_day.jpg",
+    "open_night.jpg",
+]
+
+# Confirmation re-check delay in seconds
+CONFIRMATION_DELAY = 15
 
 
 def log(module: str, message: str) -> None:
@@ -63,6 +93,47 @@ def load_config() -> dict:
             return json.load(f)
     log("config", "Config file not found, using defaults")
     return {}
+
+
+def load_reference_images() -> list:
+    """Load reference images from the reference directory.
+
+    Returns a list of (label, PIL.Image) tuples for few-shot prompting.
+    """
+    references = []
+
+    if not REFERENCE_DIR.exists():
+        log("reference", f"Reference directory not found: {REFERENCE_DIR}")
+        log("reference", "Running in zero-shot mode (no reference images)")
+        return references
+
+    label_map = {
+        "closed_day.jpg": "Example - CLOSED gate (daytime):",
+        "closed_night.jpg": "Example - CLOSED gate (nighttime):",
+        "open_day.jpg": "Example - OPEN gate (daytime):",
+        "open_night.jpg": "Example - OPEN gate (nighttime):",
+    }
+
+    for filename in REFERENCE_FILENAMES:
+        filepath = REFERENCE_DIR / filename
+        if filepath.exists():
+            try:
+                img = Image.open(filepath)
+                img.load()  # Force load into memory
+                label = label_map[filename]
+                references.append((label, img))
+                log("reference", f"Loaded: {filename}")
+            except Exception as e:
+                log("reference", f"ERROR loading {filename}: {e}")
+        else:
+            log("reference", f"Not found (optional): {filename}")
+
+    if references:
+        log("reference", f"Loaded {len(references)} reference images for few-shot mode")
+    else:
+        log("reference", "No reference images found, running in zero-shot mode")
+
+    return references
 
 
 def find_best_model(client: genai.Client) -> str | None:
@@ -174,28 +245,114 @@ def save_snapshot(image_data: bytes, camera_name: str) -> str | None:
         return None
 
 
-def analyze_gate(client: genai.Client, model_name: str, image_data: bytes, max_retries: int = 3) -> str:
-    """Send image to Gemini Vision and get gate status."""
+def parse_gate_response(response_text: str) -> tuple[str, int]:
+    """Parse Gemini response to extract status and confidence.
+
+    Returns:
+        Tuple of (status, confidence) where status is 'open'/'closed'/'unknown'
+        and confidence is 0-100.
+    """
+    text = response_text.strip()
+
+    # Try parsing as JSON first
+    try:
+        # Strip markdown code fences if present
+        cleaned = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
+        cleaned = re.sub(r'\s*```$', '', cleaned, flags=re.MULTILINE)
+        cleaned = cleaned.strip()
+
+        data = json.loads(cleaned)
+        status = data.get("status", "UNKNOWN").upper()
+        confidence = int(data.get("confidence", 0))
+
+        if status in ("OPEN", "CLOSED", "UNKNOWN"):
+            return status.lower(), min(max(confidence, 0), 100)
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        pass
+
+    # Fallback: look for JSON-like pattern in the text
+    json_match = re.search(r'\{[^}]*"status"\s*:\s*"(OPEN|CLOSED|UNKNOWN)"[^}]*\}', text, re.IGNORECASE)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            status = data.get("status", "UNKNOWN").upper()
+            confidence = int(data.get("confidence", 0))
+            return status.lower(), min(max(confidence, 0), 100)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Last resort: look for status keywords
+    upper = text.upper()
+    if "OPEN" in upper:
+        return "open", 50  # Low confidence for unstructured response
+    if "CLOSED" in upper:
+        return "closed", 50
+    return "unknown", 0
+
+
+def build_contents(reference_images: list, query_image: Image.Image) -> list:
+    """Build the contents list for the Gemini API call.
+
+    Args:
+        reference_images: List of (label, PIL.Image) tuples
+        query_image: The current gate image to classify
+    """
+    contents = []
+
+    if reference_images:
+        contents.append(VISION_PROMPT_WITH_REFS)
+        # Add reference images as few-shot examples
+        for label, img in reference_images:
+            contents.append(label)
+            contents.append(img)
+        contents.append("Now classify this image:")
+    else:
+        contents.append(VISION_PROMPT_NO_REFS)
+
+    contents.append(query_image)
+    return contents
+
+
+def analyze_gate(
+    client: genai.Client,
+    model_name: str,
+    image_data: bytes,
+    reference_images: list,
+    confidence_threshold: int,
+    max_retries: int = 3,
+) -> tuple[str, int]:
+    """Send image to Gemini Vision and get gate status.
+
+    Returns:
+        Tuple of (status, confidence) where status is 'open'/'closed'/'unknown'/'error'
+    """
     log("vision", f"Analyzing image with {model_name}...")
 
     # Convert bytes to PIL Image for Gemini
-    image = Image.open(io.BytesIO(image_data))
+    query_image = Image.open(io.BytesIO(image_data))
+
+    # Build contents with reference images
+    contents = build_contents(reference_images, query_image)
 
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=[VISION_PROMPT, image],
+                contents=contents,
+                config=types.GenerateContentConfig(temperature=0.0),
             )
 
-            result = response.text.strip().upper()
-            log("vision", f"Gemini response: {result}")
+            raw = response.text.strip()
+            log("vision", f"Gemini response: {raw}")
 
-            if result in ("OPEN", "CLOSED", "UNKNOWN"):
-                return result.lower()
+            status, confidence = parse_gate_response(raw)
+            log("vision", f"Parsed: status={status}, confidence={confidence}")
 
-            log("vision", "Unexpected response, treating as unknown")
-            return "unknown"
+            if confidence < confidence_threshold:
+                log("vision", f"Confidence {confidence} below threshold {confidence_threshold}, treating as unknown")
+                return "unknown", confidence
+
+            return status, confidence
 
         except Exception as e:
             error_str = str(e)
@@ -206,10 +363,10 @@ def analyze_gate(client: genai.Client, model_name: str, image_data: bytes, max_r
                 time.sleep(wait_time)
             else:
                 log("vision", f"ERROR: API call failed: {e}")
-                return "error"
+                return "error", 0
 
     log("vision", "ERROR: Max retries exceeded due to rate limiting")
-    return "error"
+    return "error", 0
 
 
 def create_mqtt_client(config: dict) -> mqtt.Client:
@@ -286,9 +443,11 @@ def main() -> None:
     camera_name = config.get("camera_name", "exterior_frente")
     topic_prefix = config.get("mqtt_topic_prefix", "homeassistant/gate")
     check_interval = config.get("check_interval_minutes", 30) * 60
+    confidence_threshold = config.get("confidence_threshold", 70)
 
     log("main", f"Camera: {camera_name}")
     log("main", f"Check interval: {check_interval // 60} minutes")
+    log("main", f"Confidence threshold: {confidence_threshold}%")
 
     # Initialize Gemini client
     gemini_client = genai.Client(api_key=api_key)
@@ -300,6 +459,9 @@ def main() -> None:
         sys.exit(1)
 
     log("main", f"Using model: {model_name}")
+
+    # Load reference images for few-shot prompting
+    reference_images = load_reference_images()
 
     # Initialize MQTT
     mqtt_client = create_mqtt_client(config)
@@ -319,20 +481,48 @@ def main() -> None:
 
             if full_frame and gate_crop:
                 # Analyze cropped gate region with Gemini Vision
-                status = analyze_gate(gemini_client, model_name, gate_crop)
+                status, confidence = analyze_gate(
+                    gemini_client, model_name, gate_crop,
+                    reference_images, confidence_threshold,
+                )
 
                 if status != "error":
+                    # If gate detected as OPEN, do a confirmation re-check
+                    if status == "open":
+                        log("main", f"Gate appears OPEN (confidence: {confidence}%). Re-checking in {CONFIRMATION_DELAY}s...")
+                        time.sleep(CONFIRMATION_DELAY)
+
+                        # Capture a fresh frame for confirmation
+                        full_frame_2, gate_crop_2 = capture_rtsp_frame(rtsp_url)
+                        if full_frame_2 and gate_crop_2:
+                            status_2, confidence_2 = analyze_gate(
+                                gemini_client, model_name, gate_crop_2,
+                                reference_images, confidence_threshold,
+                            )
+                            if status_2 != "open":
+                                log("main", f"Confirmation check: {status_2} (confidence: {confidence_2}%). "
+                                    "First check was likely a false positive, ignoring.")
+                                status = status_2
+                                confidence = confidence_2
+                                full_frame = full_frame_2
+                            else:
+                                log("main", f"Confirmation check: OPEN (confidence: {confidence_2}%). Gate is confirmed open.")
+                                # Use the second (more recent) snapshot
+                                full_frame = full_frame_2
+                        else:
+                            log("main", "Confirmation capture failed, proceeding with initial result")
+
                     # Publish status
                     publish_status(mqtt_client, topic_prefix, camera_name, status)
 
-                    # Send alert if gate is open
+                    # Send alert if gate is confirmed open
                     if status == "open":
                         # Save full snapshot for notification
                         snapshot_path = save_snapshot(full_frame, camera_name)
                         publish_alert(mqtt_client, topic_prefix, camera_name, snapshot_path)
                         log("main", "GATE IS OPEN - Alert sent with snapshot")
                     else:
-                        log("main", f"Gate status: {status}")
+                        log("main", f"Gate status: {status} (confidence: {confidence}%)")
             else:
                 log("main", "Skipping analysis due to capture failure")
 

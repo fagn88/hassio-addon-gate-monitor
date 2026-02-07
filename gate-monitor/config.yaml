@@ -1,6 +1,6 @@
 name: "Gate Monitor"
 description: "Monitor gate status using Gemini Vision API"
-version: "1.0.11"
+version: "1.1.0"
 slug: "gate-monitor"
 init: false
 arch:
@@ -18,6 +18,7 @@ options:
   rtsp_url: ""
   check_interval_minutes: 30
   gemini_api_key: ""
+  confidence_threshold: 70
   mqtt_broker: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
@@ -28,6 +29,7 @@ schema:
   rtsp_url: url
   check_interval_minutes: int(1,1440)
   gemini_api_key: password
+  confidence_threshold: int(50,100)
   mqtt_broker: str
   mqtt_port: port
   mqtt_username: str
