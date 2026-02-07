@@ -77,9 +77,6 @@ REFERENCE_FILENAMES = [
     "open_night.jpg",
 ]
 
-# Confirmation re-check delay in seconds
-CONFIRMATION_DELAY = 15
-
 
 def log(module: str, message: str) -> None:
     """Print a log message with module prefix."""
@@ -487,37 +484,49 @@ def main() -> None:
                 )
 
                 if status != "error":
-                    # If gate detected as OPEN, do a confirmation re-check
+                    # If gate detected as OPEN, do immediate confirmation (best of 3)
                     if status == "open":
-                        log("main", f"Gate appears OPEN (confidence: {confidence}%). Re-checking in {CONFIRMATION_DELAY}s...")
-                        time.sleep(CONFIRMATION_DELAY)
+                        log("main", f"[1/3] Gate appears OPEN (confidence: {confidence}%). Confirming immediately...")
 
-                        # Capture a fresh frame for confirmation
+                        # 2nd check - immediate
                         full_frame_2, gate_crop_2 = capture_rtsp_frame(rtsp_url)
                         if full_frame_2 and gate_crop_2:
                             status_2, confidence_2 = analyze_gate(
                                 gemini_client, model_name, gate_crop_2,
                                 reference_images, confidence_threshold,
                             )
-                            if status_2 != "open":
-                                log("main", f"Confirmation check: {status_2} (confidence: {confidence_2}%). "
-                                    "First check was likely a false positive, ignoring.")
-                                status = status_2
-                                confidence = confidence_2
+                            if status_2 == "open":
+                                # Both agree: OPEN confirmed
+                                log("main", f"[2/3] Confirmed OPEN (confidence: {confidence_2}%). Gate is open.")
+                                status = "open"
                                 full_frame = full_frame_2
                             else:
-                                log("main", f"Confirmation check: OPEN (confidence: {confidence_2}%). Gate is confirmed open.")
-                                # Use the second (more recent) snapshot
-                                full_frame = full_frame_2
+                                # Disagreement (OPEN vs CLOSED/UNKNOWN) - tiebreaker
+                                log("main", f"[2/3] Got {status_2} (confidence: {confidence_2}%). Disagreement, doing tiebreaker...")
+                                full_frame_3, gate_crop_3 = capture_rtsp_frame(rtsp_url)
+                                if full_frame_3 and gate_crop_3:
+                                    status_3, confidence_3 = analyze_gate(
+                                        gemini_client, model_name, gate_crop_3,
+                                        reference_images, confidence_threshold,
+                                    )
+                                    log("main", f"[3/3] Tiebreaker: {status_3} (confidence: {confidence_3}%)")
+                                    status = status_3
+                                    confidence = confidence_3
+                                    full_frame = full_frame_3
+                                else:
+                                    log("main", "[3/3] Tiebreaker capture failed, using 2nd result (closed)")
+                                    status = status_2
+                                    confidence = confidence_2
+                                    full_frame = full_frame_2
                         else:
-                            log("main", "Confirmation capture failed, proceeding with initial result")
+                            log("main", "[2/3] Confirmation capture failed, discarding OPEN detection")
+                            status = "unknown"
 
                     # Publish status
                     publish_status(mqtt_client, topic_prefix, camera_name, status)
 
                     # Send alert if gate is confirmed open
                     if status == "open":
-                        # Save full snapshot for notification
                         snapshot_path = save_snapshot(full_frame, camera_name)
                         publish_alert(mqtt_client, topic_prefix, camera_name, snapshot_path)
                         log("main", "GATE IS OPEN - Alert sent with snapshot")

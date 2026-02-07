@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1] - 2026-02-07
+
+### Changed
+- Replaced timed re-check (15s delay) with immediate best-of-3 confirmation logic
+- On OPEN: immediate 2nd check. If both agree → alert. If they disagree → 3rd tiebreaker check decides.
+- Faster response and more reliable false positive elimination
+
 ## [1.1.0] - 2026-02-07
 
 ### Added
