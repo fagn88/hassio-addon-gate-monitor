@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.2] - 2026-02-07
+
+### Changed
+- Auto-crop reference images using same GATE_CROP coordinates as query images
+- Ensures reference and query images show the exact same region for accurate comparison
+
 ## [1.1.1] - 2026-02-07
 
 ### Changed

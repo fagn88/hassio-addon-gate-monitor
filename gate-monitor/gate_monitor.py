@@ -117,9 +117,18 @@ def load_reference_images() -> list:
             try:
                 img = Image.open(filepath)
                 img.load()  # Force load into memory
+                # Crop to same gate region used for analysis
+                w, h = img.size
+                crop_box = (
+                    int(w * GATE_CROP["x_start"]),
+                    int(h * GATE_CROP["y_start"]),
+                    int(w * GATE_CROP["x_end"]),
+                    int(h * GATE_CROP["y_end"]),
+                )
+                img = img.crop(crop_box)
                 label = label_map[filename]
                 references.append((label, img))
-                log("reference", f"Loaded: {filename}")
+                log("reference", f"Loaded: {filename} (cropped to {img.size[0]}x{img.size[1]})")
             except Exception as e:
                 log("reference", f"ERROR loading {filename}: {e}")
         else:
