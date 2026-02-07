@@ -82,10 +82,10 @@ For best accuracy, provide reference images of your gate in different states. Th
 
 ### Tips for Reference Images
 
-- Use the **cropped gate region** from the camera (same area the add-on analyzes)
+- Images can be **full-frame** - the add-on automatically crops them to the same gate region used for analysis
 - Capture images in different lighting conditions for robustness
 - The add-on works without reference images (zero-shot mode) but accuracy is significantly better with them
-- You can find cropped snapshots saved by the add-on in `/config/www/gate-monitor/` to use as starting points
+- You can find snapshots saved by the add-on in `/config/www/gate-monitor/` to use as starting points
 
 ## MQTT Topics
 
@@ -134,7 +134,7 @@ Add this automation to receive notifications with the gate snapshot:
 2. **Crop**: Extracts only the gate region (upper-left corner by default)
 3. **Analyze**: Sends cropped image to Gemini Vision API with reference images as few-shot examples
 4. **Evaluate**: Parses JSON response for status and confidence score
-5. **Confirm**: If gate appears OPEN, waits 15 seconds and re-checks with a fresh frame
+5. **Confirm**: If gate appears OPEN, runs immediate best-of-3 confirmation (see below)
 6. **Publish**: Publishes confirmed result to MQTT
 7. **Alert**: If gate is confirmed open, saves full snapshot and sends alert
 8. **Wait**: Sleeps for the configured interval before next check
@@ -163,14 +163,15 @@ GATE_CROP = {
 
 The add-on asks Gemini to return a confidence score (0-100) with each classification. Detections below the configured threshold are treated as UNKNOWN, preventing low-confidence guesses from triggering false alerts. The default threshold of 70 works well in practice - lower it if the gate is rarely detected, raise it if you still get false positives.
 
-### Confirmation Re-check
+### Best-of-3 Confirmation
 
-When the gate is detected as OPEN, the add-on automatically:
-1. Waits 15 seconds
-2. Captures a fresh frame
-3. Re-analyzes with Gemini
+When the gate is detected as OPEN, the add-on runs an immediate best-of-3 confirmation:
 
-Only if **both** checks agree the gate is OPEN will an alert be sent. This catches momentary visual artifacts, lighting changes, or model hallucinations. The 15-second delay is acceptable for gate monitoring where immediate alerts aren't critical.
+1. **1st check** → OPEN detected
+2. **2nd check** (immediate) → If also OPEN → **alert confirmed**
+3. **2nd check** → If CLOSED/UNKNOWN → **3rd tiebreaker check** → whatever it returns is the final answer
+
+This catches false positives without adding any delay. Only when the first two checks disagree does a third tiebreaker run.
 
 ## Snapshots
 

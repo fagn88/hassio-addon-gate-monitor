@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.3] - 2026-02-07
+
+### Changed
+- Updated documentation with best-of-3 confirmation logic and auto-crop details
+
 ## [1.1.2] - 2026-02-07
 
 ### Changed
