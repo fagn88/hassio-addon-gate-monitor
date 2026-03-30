@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.2.0] - 2026-03-30
+
+### Added
+- **Model fallback cascade**: automatically tries the next available model when the current one is unavailable (503/504) or rate-limited (429)
+- Retry with backoff for transient errors (503 UNAVAILABLE, 504 Gateway Timeout) — previously only 429 was retried
+
+### Changed
+- `find_best_model()` replaced by `find_available_models()` which returns a full ranked list
+- `analyze_gate()` iterates through all available models, 2 retries per model, before giving up
+- Only returns error when **all** models are exhausted
+
 ## [1.1.3] - 2026-02-07
 
 ### Changed

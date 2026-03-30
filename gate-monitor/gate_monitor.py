@@ -142,8 +142,8 @@ def load_reference_images() -> list:
     return references
 
 
-def find_best_model(client: genai.Client) -> str | None:
-    """List available models and return the best one for vision tasks."""
+def find_available_models(client: genai.Client) -> list[str]:
+    """List available models and return them ranked by preference (best first)."""
     log("models", "Listing available Gemini models...")
 
     available_models = []
@@ -159,28 +159,29 @@ def find_best_model(client: genai.Client) -> str | None:
                 log("models", f"  Found: {model_name}")
     except Exception as e:
         log("models", f"ERROR listing models: {e}")
-        return None
+        return []
 
-    # Find the best available model from our preference list
+    # Build ranked list from preference order
+    ranked = []
+    seen = set()
     for preferred in PREFERRED_MODELS:
         for available in available_models:
-            # Check if the preferred model matches (with or without version suffix)
-            if available.startswith(preferred) or available == preferred:
-                log("models", f"Selected model: {available}")
-                return available
+            if available not in seen and (available.startswith(preferred) or available == preferred):
+                ranked.append(available)
+                seen.add(available)
 
-    # If none of our preferred models found, try the first gemini model
+    # Append any remaining gemini models not in our preference list
     for available in available_models:
-        if "gemini" in available.lower() and "pro" in available.lower():
-            log("models", f"Fallback model: {available}")
-            return available
+        if available not in seen:
+            ranked.append(available)
+            seen.add(available)
 
-    if available_models:
-        log("models", f"Using first available: {available_models[0]}")
-        return available_models[0]
+    if ranked:
+        log("models", f"Ranked models: {', '.join(ranked)}")
+    else:
+        log("models", "ERROR: No Gemini models found!")
 
-    log("models", "ERROR: No Gemini models found!")
-    return None
+    return ranked
 
 
 def capture_rtsp_frame(rtsp_url: str) -> tuple[bytes, bytes] | tuple[None, None]:
@@ -321,58 +322,65 @@ def build_contents(reference_images: list, query_image: Image.Image) -> list:
 
 def analyze_gate(
     client: genai.Client,
-    model_name: str,
+    models: list[str],
     image_data: bytes,
     reference_images: list,
     confidence_threshold: int,
-    max_retries: int = 3,
-) -> tuple[str, int]:
-    """Send image to Gemini Vision and get gate status.
+    retries_per_model: int = 2,
+) -> tuple[str, int, str]:
+    """Send image to Gemini Vision and get gate status, cascading through models on failure.
 
     Returns:
-        Tuple of (status, confidence) where status is 'open'/'closed'/'unknown'/'error'
+        Tuple of (status, confidence, model_used) where status is 'open'/'closed'/'unknown'/'error'
     """
-    log("vision", f"Analyzing image with {model_name}...")
-
     # Convert bytes to PIL Image for Gemini
     query_image = Image.open(io.BytesIO(image_data))
 
     # Build contents with reference images
     contents = build_contents(reference_images, query_image)
 
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(temperature=0.0),
-            )
+    for model_idx, model_name in enumerate(models):
+        log("vision", f"Analyzing image with {model_name}...")
 
-            raw = response.text.strip()
-            log("vision", f"Gemini response: {raw}")
+        for attempt in range(retries_per_model):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(temperature=0.0),
+                )
 
-            status, confidence = parse_gate_response(raw)
-            log("vision", f"Parsed: status={status}, confidence={confidence}")
+                raw = response.text.strip()
+                log("vision", f"Gemini response: {raw}")
 
-            if confidence < confidence_threshold:
-                log("vision", f"Confidence {confidence} below threshold {confidence_threshold}, treating as unknown")
-                return "unknown", confidence
+                status, confidence = parse_gate_response(raw)
+                log("vision", f"Parsed: status={status}, confidence={confidence}")
 
-            return status, confidence
+                if confidence < confidence_threshold:
+                    log("vision", f"Confidence {confidence} below threshold {confidence_threshold}, treating as unknown")
+                    return "unknown", confidence, model_name
 
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                # Rate limited - wait and retry
-                wait_time = 60 * (attempt + 1)  # 60s, 120s, 180s
-                log("vision", f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
-                time.sleep(wait_time)
-            else:
-                log("vision", f"ERROR: API call failed: {e}")
-                return "error", 0
+                return status, confidence, model_name
 
-    log("vision", "ERROR: Max retries exceeded due to rate limiting")
-    return "error", 0
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "504" in error_str or "Gateway Time-out" in error_str
+                if is_rate_limit or is_transient:
+                    if attempt < retries_per_model - 1:
+                        wait_time = 30 * (attempt + 1)
+                        reason = "Rate limited" if is_rate_limit else "Service unavailable"
+                        log("vision", f"{reason}. Waiting {wait_time}s before retry {attempt + 1}/{retries_per_model}...")
+                        time.sleep(wait_time)
+                    else:
+                        remaining = len(models) - model_idx - 1
+                        log("vision", f"{model_name} unavailable after {retries_per_model} attempts. {remaining} fallback model(s) remaining.")
+                else:
+                    log("vision", f"ERROR: {model_name} failed: {e}")
+                    break  # Non-transient error, skip to next model
+
+    log("vision", "ERROR: All models exhausted, no successful response")
+    return "error", 0, ""
 
 
 def create_mqtt_client(config: dict) -> mqtt.Client:
@@ -458,13 +466,13 @@ def main() -> None:
     # Initialize Gemini client
     gemini_client = genai.Client(api_key=api_key)
 
-    # Find the best available model
-    model_name = find_best_model(gemini_client)
-    if not model_name:
-        log("main", "ERROR: Could not find a suitable Gemini model")
+    # Find available models ranked by preference
+    available_models = find_available_models(gemini_client)
+    if not available_models:
+        log("main", "ERROR: Could not find any Gemini models")
         sys.exit(1)
 
-    log("main", f"Using model: {model_name}")
+    log("main", f"Primary model: {available_models[0]} ({len(available_models)} available)")
 
     # Load reference images for few-shot prompting
     reference_images = load_reference_images()
@@ -487,8 +495,8 @@ def main() -> None:
 
             if full_frame and gate_crop:
                 # Analyze cropped gate region with Gemini Vision
-                status, confidence = analyze_gate(
-                    gemini_client, model_name, gate_crop,
+                status, confidence, _ = analyze_gate(
+                    gemini_client, available_models, gate_crop,
                     reference_images, confidence_threshold,
                 )
 
@@ -500,8 +508,8 @@ def main() -> None:
                         # 2nd check - immediate
                         full_frame_2, gate_crop_2 = capture_rtsp_frame(rtsp_url)
                         if full_frame_2 and gate_crop_2:
-                            status_2, confidence_2 = analyze_gate(
-                                gemini_client, model_name, gate_crop_2,
+                            status_2, confidence_2, _ = analyze_gate(
+                                gemini_client, available_models, gate_crop_2,
                                 reference_images, confidence_threshold,
                             )
                             if status_2 == "open":
@@ -514,8 +522,8 @@ def main() -> None:
                                 log("main", f"[2/3] Got {status_2} (confidence: {confidence_2}%). Disagreement, doing tiebreaker...")
                                 full_frame_3, gate_crop_3 = capture_rtsp_frame(rtsp_url)
                                 if full_frame_3 and gate_crop_3:
-                                    status_3, confidence_3 = analyze_gate(
-                                        gemini_client, model_name, gate_crop_3,
+                                    status_3, confidence_3, _ = analyze_gate(
+                                        gemini_client, available_models, gate_crop_3,
                                         reference_images, confidence_threshold,
                                     )
                                     log("main", f"[3/3] Tiebreaker: {status_3} (confidence: {confidence_3}%)")
