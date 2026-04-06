@@ -1,18 +1,19 @@
 # Gate Monitor Add-on for Home Assistant
 
-Monitor your gate status using AI vision analysis with Google Gemini API.
+Monitor your gate status using hybrid AI vision analysis: local OpenCV comparison first, Google Gemini 3.x API only when needed.
 
 ## Features
 
-- Captures frames from RTSP camera
-- Crops image to gate region for accurate detection
+- **Hybrid detection**: Local SSIM comparison handles ~90% of checks without API calls
+- **Day/night auto-detection**: Selects correct reference images based on frame color saturation
+- Captures frames from RTSP camera and crops to gate region
 - **Few-shot learning** with reference images of your specific gate
-- Uses Gemini Vision API to detect gate status (open/closed)
+- Uses Gemini Vision API (3.x only) to confirm uncertain detections
 - **Confidence scoring** with configurable threshold
-- **Confirmation re-check** to eliminate false positives
+- **Safe fallback**: Returns "unknown" instead of false positives when API is unavailable
 - Publishes status to MQTT for Home Assistant automations
 - Sends snapshot with notifications when gate is open
-- Auto-selects best available Gemini model
+- Auto-selects best available Gemini 3.x flash model
 - Configurable check interval (default: 30 minutes)
 
 ## Installation
@@ -39,6 +40,7 @@ Monitor your gate status using AI vision analysis with Google Gemini API.
 | `check_interval_minutes` | `30` | Minutes between checks |
 | `gemini_api_key` | - | Google Gemini API key (required) |
 | `confidence_threshold` | `70` | Minimum confidence (50-100) to accept a detection |
+| `ssim_threshold` | `0.85` | SSIM similarity threshold (0.5-1.0) for local comparison |
 | `mqtt_broker` | `core-mosquitto` | MQTT broker hostname |
 | `mqtt_port` | `1883` | MQTT broker port |
 | `mqtt_username` | - | MQTT username |
@@ -132,11 +134,15 @@ Add this automation to receive notifications with the gate snapshot:
 
 1. **Capture**: Grabs a frame from the RTSP camera stream
 2. **Crop**: Extracts only the gate region (upper-left corner by default)
-3. **Analyze**: Sends cropped image to Gemini Vision API with reference images as few-shot examples
-4. **Evaluate**: Parses JSON response for status and confidence score
-5. **Confirm**: If gate appears OPEN, runs immediate best-of-3 confirmation (see below)
-6. **Publish**: Publishes confirmed result to MQTT
-7. **Alert**: If gate is confirmed open, saves full snapshot and sends alert
+3. **Day/night detect**: Checks frame color saturation to select correct reference images
+4. **Local compare (Layer 1)**: SSIM comparison against reference images
+   - High similarity to "closed" → report closed, **no API call needed**
+   - High similarity to "open" → proceed to Layer 2 for confirmation
+   - Inconclusive → proceed to Layer 2
+5. **Gemini 3.x confirm (Layer 2)**: Sends image to Gemini Vision API (only 3.x models)
+   - If rate-limited/unavailable → report "unknown" (never uses weak models)
+6. **Publish**: Publishes result to MQTT
+7. **Alert**: If gate is open, saves full snapshot and sends alert
 8. **Wait**: Sleeps for the configured interval before next check
 
 ### Gate Region Cropping
@@ -163,15 +169,19 @@ GATE_CROP = {
 
 The add-on asks Gemini to return a confidence score (0-100) with each classification. Detections below the configured threshold are treated as UNKNOWN, preventing low-confidence guesses from triggering false alerts. The default threshold of 70 works well in practice - lower it if the gate is rarely detected, raise it if you still get false positives.
 
-### Best-of-3 Confirmation
+### SSIM Local Comparison
 
-When the gate is detected as OPEN, the add-on runs an immediate best-of-3 confirmation:
+Before calling the Gemini API, the add-on compares the current frame against reference images using SSIM (Structural Similarity Index). This resolves most "closed" detections locally without any API call, saving quota and reducing latency.
 
-1. **1st check** → OPEN detected
-2. **2nd check** (immediate) → If also OPEN → **alert confirmed**
-3. **2nd check** → If CLOSED/UNKNOWN → **3rd tiebreaker check** → whatever it returns is the final answer
+The `ssim_threshold` (default 0.85) controls how similar the frame must be to a reference to count as a confident match. Lower it if local detection rarely matches; raise it if you get incorrect local matches.
 
-This catches false positives without adding any delay. Only when the first two checks disagree does a third tiebreaker run.
+Day vs night reference selection is automatic: the add-on measures color saturation to determine if the frame is in color (day) or grayscale/IR (night), and compares against the corresponding reference images.
+
+### Model Selection
+
+The add-on only uses Gemini 3.x models. Older versions (2.x, 1.5) produce unreliable results for gate detection and are excluded. Within 3.x, flash models are preferred over pro (better free tier limits). Models not suitable for vision tasks (TTS, live, image generation, etc.) are automatically filtered out.
+
+If all 3.x models are rate-limited or unavailable, the add-on reports "unknown" instead of falling back to weaker models — preventing false positives.
 
 ## Snapshots
 
@@ -183,23 +193,20 @@ Access via Home Assistant: `/local/gate-monitor/{filename}`
 
 ## API Token Usage
 
-Estimated usage depends on mode:
+With hybrid detection, most checks are resolved locally via SSIM and never call the API. Only inconclusive or potential "open" detections trigger an API call.
 
-**Zero-shot mode** (no reference images):
-- ~300-500 tokens per check
-- ~500,000-750,000 tokens per month (48 checks/day)
+**Estimated API usage** (with reference images, 48 checks/day):
+- ~90% resolved locally → ~5 API calls/day
+- ~1,500-2,000 tokens per API call
+- ~7,500-10,000 tokens/day (~225K-300K/month)
 
-**Few-shot mode** (with 4 reference images):
-- ~1,500-2,000 tokens per check
-- ~2-3M tokens per month (48 checks/day)
-- Confirmation re-checks only add tokens when gate appears open
-
-All estimates are well within Gemini Flash free tier limits. The add-on automatically selects flash models which have higher free tier limits.
+Well within Gemini Flash free tier limits.
 
 ## Troubleshooting
 
 ### Rate Limiting (429 errors)
-- The add-on automatically retries with delays (60s, 120s, 180s)
+- With hybrid detection, API calls are much less frequent
+- If rate-limited, the add-on tries other 3.x models then reports "unknown" (no false positives)
 - If persistent, increase `check_interval_minutes`
 - Create a new API key if daily quota is exhausted
 
@@ -207,7 +214,8 @@ All estimates are well within Gemini Flash free tier limits. The add-on automati
 1. Add reference images to `/config/www/gate-monitor/reference/`
 2. Increase `confidence_threshold` (try 80 or 85)
 3. Verify the gate is clearly visible in the cropped region
-4. Check add-on logs for confidence scores to tune the threshold
+4. Check add-on logs for SSIM scores and confidence values to tune thresholds
+5. Take new reference images from the add-on's own snapshots for better SSIM matching
 
 ### Wrong Detection
 - Verify the gate is visible in the cropped region

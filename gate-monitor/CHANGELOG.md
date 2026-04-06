@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.3] - 2026-04-06
+
+### Changed
+- Prioritize flash models over pro in ranking for better free tier availability
+
+## [1.3.2] - 2026-04-06
+
+### Fixed
+- Use VERSION constant for startup log instead of hardcoded string
+
 ## [1.3.1] - 2026-04-06
 
 ### Fixed
