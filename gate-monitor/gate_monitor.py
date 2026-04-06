@@ -321,34 +321,31 @@ def find_available_models(client: genai.Client) -> list[str]:
     return filtered
 
 
-def capture_rtsp_frame(rtsp_url: str) -> tuple[bytes, bytes] | tuple[None, None]:
+def capture_rtsp_frame(rtsp_url: str) -> tuple[bytes, bytes, np.ndarray] | tuple[None, None, None]:
     """Capture a single frame from RTSP stream.
 
     Returns:
-        Tuple of (full_frame_bytes, cropped_gate_bytes) or (None, None) on error
+        Tuple of (full_frame_bytes, cropped_gate_bytes, cropped_gate_bgr) or (None, None, None)
     """
     log("camera", "Capturing frame from camera...")
 
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
         log("camera", "ERROR: Failed to open RTSP stream")
-        return None, None
+        return None, None, None
 
     ret, frame = cap.read()
     cap.release()
 
     if not ret:
         log("camera", "ERROR: Failed to capture frame")
-        return None, None
+        return None, None, None
 
-    # Resize full frame
     frame = cv2.resize(frame, (640, 480))
     height, width = frame.shape[:2]
 
-    # Encode full frame for snapshot
     _, full_buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-    # Crop to gate region for analysis
     x1 = int(width * GATE_CROP["x_start"])
     x2 = int(width * GATE_CROP["x_end"])
     y1 = int(height * GATE_CROP["y_start"])
@@ -358,7 +355,7 @@ def capture_rtsp_frame(rtsp_url: str) -> tuple[bytes, bytes] | tuple[None, None]
     _, crop_buffer = cv2.imencode('.jpg', cropped, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
     log("camera", f"Frame captured: full 640x480, gate crop {x2-x1}x{y2-y1}")
-    return full_buffer.tobytes(), crop_buffer.tobytes()
+    return full_buffer.tobytes(), crop_buffer.tobytes(), cropped
 
 
 def save_snapshot(image_data: bytes, camera_name: str) -> str | None:
@@ -574,9 +571,8 @@ def publish_addon_status(client: mqtt.Client, topic_prefix: str, status: str) ->
 
 def main() -> None:
     """Main entry point."""
-    log("main", "Gate Monitor starting...")
+    log("main", "Gate Monitor v1.3.0 starting (hybrid OpenCV + Gemini 3.x)...")
 
-    # Load configuration
     config = load_config()
 
     rtsp_url = config.get("rtsp_url", "")
@@ -597,95 +593,117 @@ def main() -> None:
     log("main", f"Camera: {camera_name}")
     log("main", f"Check interval: {check_interval // 60} minutes")
     log("main", f"Confidence threshold: {confidence_threshold}%")
+    log("main", f"SSIM threshold: {SSIM_THRESHOLD}")
+    log("main", f"Min model version: {MIN_MODEL_VERSION}")
 
     # Initialize Gemini client
     gemini_client = genai.Client(api_key=api_key)
 
-    # Find available models ranked by preference
+    # Find available 3.x+ models
     available_models = find_available_models(gemini_client)
-    if not available_models:
-        log("main", "ERROR: Could not find any Gemini models")
-        sys.exit(1)
+    if available_models:
+        log("main", f"Primary model: {available_models[0]} ({len(available_models)} available)")
+    else:
+        log("main", "WARNING: No 3.x models found. Running in local-only mode.")
 
-    log("main", f"Primary model: {available_models[0]} ({len(available_models)} available)")
-
-    # Load reference images for few-shot prompting
+    # Load reference images (PIL for Gemini, OpenCV for SSIM)
     reference_images = load_reference_images()
+    has_cv_refs = any(v is not None for v in reference_images["cv"].values())
+
+    if not has_cv_refs:
+        log("main", "WARNING: No reference images for local comparison. All checks will use API.")
 
     # Initialize MQTT
     mqtt_client = create_mqtt_client(config)
-
-    # Publish online status
     publish_addon_status(mqtt_client, topic_prefix, "online")
 
-    # Initial delay to allow services to stabilize
     time.sleep(5)
 
     try:
         while True:
             log("main", "Starting gate check...")
 
-            # Capture frame (full for snapshot, cropped for analysis)
-            full_frame, gate_crop = capture_rtsp_frame(rtsp_url)
+            full_frame, gate_crop, gate_crop_bgr = capture_rtsp_frame(rtsp_url)
 
-            if full_frame and gate_crop:
-                # Analyze cropped gate region with Gemini Vision
-                status, confidence, _ = analyze_gate(
-                    gemini_client, available_models, gate_crop,
-                    reference_images, confidence_threshold,
-                )
-
-                if status != "unavailable":
-                    # If gate detected as OPEN, do immediate confirmation (best of 3)
-                    if status == "open":
-                        log("main", f"[1/3] Gate appears OPEN (confidence: {confidence}%). Confirming immediately...")
-
-                        # 2nd check - immediate
-                        full_frame_2, gate_crop_2 = capture_rtsp_frame(rtsp_url)
-                        if full_frame_2 and gate_crop_2:
-                            status_2, confidence_2, _ = analyze_gate(
-                                gemini_client, available_models, gate_crop_2,
-                                reference_images, confidence_threshold,
-                            )
-                            if status_2 == "open":
-                                # Both agree: OPEN confirmed
-                                log("main", f"[2/3] Confirmed OPEN (confidence: {confidence_2}%). Gate is open.")
-                                status = "open"
-                                full_frame = full_frame_2
-                            else:
-                                # Disagreement (OPEN vs CLOSED/UNKNOWN) - tiebreaker
-                                log("main", f"[2/3] Got {status_2} (confidence: {confidence_2}%). Disagreement, doing tiebreaker...")
-                                full_frame_3, gate_crop_3 = capture_rtsp_frame(rtsp_url)
-                                if full_frame_3 and gate_crop_3:
-                                    status_3, confidence_3, _ = analyze_gate(
-                                        gemini_client, available_models, gate_crop_3,
-                                        reference_images, confidence_threshold,
-                                    )
-                                    log("main", f"[3/3] Tiebreaker: {status_3} (confidence: {confidence_3}%)")
-                                    status = status_3
-                                    confidence = confidence_3
-                                    full_frame = full_frame_3
-                                else:
-                                    log("main", "[3/3] Tiebreaker capture failed, using 2nd result (closed)")
-                                    status = status_2
-                                    confidence = confidence_2
-                                    full_frame = full_frame_2
-                        else:
-                            log("main", "[2/3] Confirmation capture failed, discarding OPEN detection")
-                            status = "unknown"
-
-                    # Publish status
-                    publish_status(mqtt_client, topic_prefix, camera_name, status)
-
-                    # Send alert if gate is confirmed open
-                    if status == "open":
-                        snapshot_path = save_snapshot(full_frame, camera_name)
-                        publish_alert(mqtt_client, topic_prefix, camera_name, snapshot_path)
-                        log("main", "GATE IS OPEN - Alert sent with snapshot")
-                    else:
-                        log("main", f"Gate status: {status} (confidence: {confidence}%)")
-            else:
+            if full_frame is None:
                 log("main", "Skipping analysis due to capture failure")
+                log("main", f"Next check in {check_interval // 60} minutes")
+                time.sleep(check_interval)
+                continue
+
+            status = "unknown"
+            confidence = 0
+            method = "none"
+
+            # Layer 1: Local SSIM comparison
+            if has_cv_refs:
+                local_status, local_score = compare_local(gate_crop_bgr, reference_images["cv"])
+
+                if local_status == "closed":
+                    # High confidence closed — no API needed
+                    status = "closed"
+                    confidence = int(local_score * 100)
+                    method = "opencv"
+                    log("main", f"Local: gate CLOSED (SSIM {local_score:.3f})")
+
+                elif local_status == "open":
+                    # Looks open locally — confirm with Gemini 3.x
+                    log("main", f"Local: possible OPEN (SSIM {local_score:.3f}), confirming with Gemini...")
+                    api_status, api_confidence, model_used = analyze_gate(
+                        gemini_client, available_models, gate_crop,
+                        reference_images["pil"], confidence_threshold,
+                    )
+                    if api_status in ("open", "closed"):
+                        status = api_status
+                        confidence = api_confidence
+                        method = f"opencv+{model_used}"
+                    elif api_status == "unavailable":
+                        # API unavailable — don't trust local "open" alone, report unknown
+                        log("main", "API unavailable, not trusting local OPEN detection")
+                        status = "unknown"
+                        method = "opencv (unconfirmed)"
+                    else:
+                        status = "unknown"
+                        confidence = api_confidence
+                        method = f"opencv+{model_used}"
+
+                else:
+                    # Inconclusive locally — ask Gemini
+                    log("main", "Local inconclusive, asking Gemini 3.x...")
+                    api_status, api_confidence, model_used = analyze_gate(
+                        gemini_client, available_models, gate_crop,
+                        reference_images["pil"], confidence_threshold,
+                    )
+                    if api_status == "unavailable":
+                        status = "unknown"
+                        method = "unavailable"
+                    else:
+                        status = api_status
+                        confidence = api_confidence
+                        method = model_used
+            else:
+                # No reference images — API only
+                api_status, api_confidence, model_used = analyze_gate(
+                    gemini_client, available_models, gate_crop,
+                    reference_images["pil"], confidence_threshold,
+                )
+                if api_status == "unavailable":
+                    status = "unknown"
+                    method = "unavailable"
+                else:
+                    status = api_status
+                    confidence = api_confidence
+                    method = model_used
+
+            # Publish result
+            publish_status(mqtt_client, topic_prefix, camera_name, status)
+
+            if status == "open":
+                snapshot_path = save_snapshot(full_frame, camera_name)
+                publish_alert(mqtt_client, topic_prefix, camera_name, snapshot_path)
+                log("main", f"GATE IS OPEN - Alert sent [{method}] (confidence: {confidence}%)")
+            else:
+                log("main", f"Gate status: {status} [{method}] (confidence: {confidence}%)")
 
             log("main", f"Next check in {check_interval // 60} minutes")
             time.sleep(check_interval)
