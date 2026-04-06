@@ -209,12 +209,13 @@ def compute_ssim(image_gray: np.ndarray, reference_gray: np.ndarray) -> float:
     return float(ssim_map.mean())
 
 
-def compare_local(gate_crop_bgr: np.ndarray, reference_images: dict) -> tuple[str, float]:
+def compare_local(gate_crop_bgr: np.ndarray, reference_images: dict, threshold: float = SSIM_THRESHOLD) -> tuple[str, float]:
     """Compare gate frame against reference images using SSIM.
 
     Args:
         gate_crop_bgr: Cropped gate region as BGR OpenCV array
         reference_images: The "cv" dict from load_reference_images()
+        threshold: SSIM threshold for confident match
 
     Returns:
         Tuple of (status, best_ssim) where status is 'open'/'closed'/'inconclusive'
@@ -241,15 +242,18 @@ def compare_local(gate_crop_bgr: np.ndarray, reference_images: dict) -> tuple[st
         scores["open"] = compute_ssim(gate_gray, open_ref)
         log("opencv", f"SSIM open_{suffix}: {scores['open']:.3f}")
 
+    # Prioritize closed: if closed is above threshold, skip API entirely
+    if "closed" in scores and scores["closed"] >= threshold:
+        log("opencv", f"Local match: closed (SSIM {scores['closed']:.3f} >= {threshold})")
+        return "closed", scores["closed"]
+
+    if "open" in scores and scores["open"] >= threshold:
+        log("opencv", f"Local match: open (SSIM {scores['open']:.3f} >= {threshold})")
+        return "open", scores["open"]
+
     best_status = max(scores, key=scores.get)
-    best_score = scores[best_status]
-
-    if best_score >= SSIM_THRESHOLD:
-        log("opencv", f"Local match: {best_status} (SSIM {best_score:.3f} >= {SSIM_THRESHOLD})")
-        return best_status, best_score
-
-    log("opencv", f"Local inconclusive (best: {best_status} at {best_score:.3f} < {SSIM_THRESHOLD})")
-    return "inconclusive", best_score
+    log("opencv", f"Local inconclusive (best: {best_status} at {scores[best_status]:.3f} < {threshold})")
+    return "inconclusive", scores[best_status]
 
 
 def _parse_model_version(name: str) -> tuple[float, int, int]:
@@ -591,9 +595,11 @@ def main() -> None:
     confidence_threshold = config.get("confidence_threshold", 70)
 
     log("main", f"Camera: {camera_name}")
+    ssim_threshold = config.get("ssim_threshold", SSIM_THRESHOLD)
+
     log("main", f"Check interval: {check_interval // 60} minutes")
     log("main", f"Confidence threshold: {confidence_threshold}%")
-    log("main", f"SSIM threshold: {SSIM_THRESHOLD}")
+    log("main", f"SSIM threshold: {ssim_threshold}")
     log("main", f"Min model version: {MIN_MODEL_VERSION}")
 
     # Initialize Gemini client
@@ -637,7 +643,7 @@ def main() -> None:
 
             # Layer 1: Local SSIM comparison
             if has_cv_refs:
-                local_status, local_score = compare_local(gate_crop_bgr, reference_images["cv"])
+                local_status, local_score = compare_local(gate_crop_bgr, reference_images["cv"], ssim_threshold)
 
                 if local_status == "closed":
                     # High confidence closed — no API needed
