@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.3.0] - 2026-04-06
+
+### Added
+- **Hybrid detection**: Local OpenCV SSIM comparison as first layer, Gemini API only when needed
+- **Day/night auto-detection**: Uses HSV saturation to select correct reference images (color = day, grayscale = night)
+- **SSIM comparison**: Structural similarity against reference images resolves ~90% of checks locally without API
+
+### Changed
+- **Gemini 3.x only**: Models below version 3.0 are excluded — returns "unknown" instead of using unreliable older models
+- **No more best-of-3**: Replaced triple API calls with single confirmation when local comparison detects possible OPEN
+- **Safe fallback**: When API is rate-limited/unavailable, publishes "unknown" instead of false positives
+- Capture function now returns raw BGR frame for OpenCV analysis
+- Reference images loaded in both PIL (Gemini) and OpenCV (SSIM) formats
+
+### Removed
+- Model fallback to Gemini 2.x and below
+- Best-of-3 confirmation logic (replaced by local pre-filter + single API confirmation)
+
 ## [1.2.0] - 2026-03-30
 
 ### Added
