@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 import paho.mqtt.client as mqtt
 from google import genai
 from google.genai import types
@@ -22,18 +23,17 @@ CONFIG_PATH = Path("/data/options.json")
 SNAPSHOT_DIR = Path("/config/www/gate-monitor")
 REFERENCE_DIR = Path("/config/www/gate-monitor/reference")
 
-# Preferred models in order (flash models first - higher free tier limits)
-PREFERRED_MODELS = [
-    "gemini-3-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-3-pro",
-    "gemini-2.5-pro",
-    "gemini-2.0-pro",
-    "gemini-1.5-pro",
-    "gemini-pro",
-]
+# Model variants unsuitable for vision tasks
+EXCLUDED_MODEL_SUFFIXES = ["-tts", "-lite", "-thinking", "-search"]
+
+# Minimum Gemini model version to use (lower versions give unreliable results)
+MIN_MODEL_VERSION = 3.0
+
+# SSIM threshold for local comparison (0.0-1.0, higher = more similar required)
+SSIM_THRESHOLD = 0.85
+
+# Saturation threshold to distinguish day (color) from night (B&W/IR)
+NIGHT_SATURATION_THRESHOLD = 30
 
 VISION_PROMPT_WITH_REFS = """You are a gate status classifier. Your task is to determine if a gate is OPEN or CLOSED by comparing the query image against the reference examples provided.
 
@@ -92,17 +92,29 @@ def load_config() -> dict:
     return {}
 
 
-def load_reference_images() -> list:
+def load_reference_images() -> dict:
     """Load reference images from the reference directory.
 
-    Returns a list of (label, PIL.Image) tuples for few-shot prompting.
+    Returns a dict with structure:
+    {
+        "pil": [(label, PIL.Image), ...],  -- for Gemini few-shot prompting
+        "cv": {                             -- for local SSIM comparison
+            "closed_day": np.ndarray | None,
+            "closed_night": np.ndarray | None,
+            "open_day": np.ndarray | None,
+            "open_night": np.ndarray | None,
+        }
+    }
     """
-    references = []
+    result = {
+        "pil": [],
+        "cv": {"closed_day": None, "closed_night": None, "open_day": None, "open_night": None},
+    }
 
     if not REFERENCE_DIR.exists():
         log("reference", f"Reference directory not found: {REFERENCE_DIR}")
         log("reference", "Running in zero-shot mode (no reference images)")
-        return references
+        return result
 
     label_map = {
         "closed_day.jpg": "Example - CLOSED gate (daytime):",
@@ -115,9 +127,9 @@ def load_reference_images() -> list:
         filepath = REFERENCE_DIR / filename
         if filepath.exists():
             try:
+                # Load PIL version for Gemini
                 img = Image.open(filepath)
-                img.load()  # Force load into memory
-                # Crop to same gate region used for analysis
+                img.load()
                 w, h = img.size
                 crop_box = (
                     int(w * GATE_CROP["x_start"]),
@@ -127,23 +139,143 @@ def load_reference_images() -> list:
                 )
                 img = img.crop(crop_box)
                 label = label_map[filename]
-                references.append((label, img))
+                result["pil"].append((label, img))
+
+                # Load OpenCV version for SSIM
+                cv_img = cv2.imread(str(filepath))
+                height, width = cv_img.shape[:2]
+                x1 = int(width * GATE_CROP["x_start"])
+                x2 = int(width * GATE_CROP["x_end"])
+                y1 = int(height * GATE_CROP["y_start"])
+                y2 = int(height * GATE_CROP["y_end"])
+                cv_cropped = cv_img[y1:y2, x1:x2]
+                cv_gray = cv2.cvtColor(cv_cropped, cv2.COLOR_BGR2GRAY)
+                key = filename.replace(".jpg", "")
+                result["cv"][key] = cv_gray
                 log("reference", f"Loaded: {filename} (cropped to {img.size[0]}x{img.size[1]})")
             except Exception as e:
                 log("reference", f"ERROR loading {filename}: {e}")
         else:
             log("reference", f"Not found (optional): {filename}")
 
-    if references:
-        log("reference", f"Loaded {len(references)} reference images for few-shot mode")
+    loaded_count = sum(1 for v in result["cv"].values() if v is not None)
+    if loaded_count > 0:
+        log("reference", f"Loaded {loaded_count} reference images (PIL + OpenCV)")
     else:
         log("reference", "No reference images found, running in zero-shot mode")
 
-    return references
+    return result
+
+
+def is_night_frame(image_bgr: np.ndarray) -> bool:
+    """Detect if a frame is night/IR (grayscale) based on color saturation."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    mean_saturation = float(hsv[:, :, 1].mean())
+    is_night = mean_saturation < NIGHT_SATURATION_THRESHOLD
+    log("opencv", f"Mean saturation: {mean_saturation:.1f} ({'night' if is_night else 'day'})")
+    return is_night
+
+
+def compute_ssim(image_gray: np.ndarray, reference_gray: np.ndarray) -> float:
+    """Compute SSIM between two grayscale images using OpenCV.
+
+    Resizes reference to match image dimensions if needed.
+    Returns similarity score 0.0-1.0.
+    """
+    if image_gray.shape != reference_gray.shape:
+        reference_gray = cv2.resize(reference_gray, (image_gray.shape[1], image_gray.shape[0]))
+
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+
+    img1 = image_gray.astype(np.float64)
+    img2 = reference_gray.astype(np.float64)
+
+    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = cv2.GaussianBlur(img1 ** 2, (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(img2 ** 2, (11, 11), 1.5) - mu2_sq
+    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+
+    numerator = (2 * mu1_mu2 + c1) * (2 * sigma12 + c2)
+    denominator = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+
+    ssim_map = numerator / denominator
+    return float(ssim_map.mean())
+
+
+def compare_local(gate_crop_bgr: np.ndarray, reference_images: dict) -> tuple[str, float]:
+    """Compare gate frame against reference images using SSIM.
+
+    Args:
+        gate_crop_bgr: Cropped gate region as BGR OpenCV array
+        reference_images: The "cv" dict from load_reference_images()
+
+    Returns:
+        Tuple of (status, best_ssim) where status is 'open'/'closed'/'inconclusive'
+    """
+    night = is_night_frame(gate_crop_bgr)
+    suffix = "night" if night else "day"
+
+    gate_gray = cv2.cvtColor(gate_crop_bgr, cv2.COLOR_BGR2GRAY)
+
+    closed_ref = reference_images.get(f"closed_{suffix}")
+    open_ref = reference_images.get(f"open_{suffix}")
+
+    if closed_ref is None and open_ref is None:
+        log("opencv", f"No {suffix} reference images available, skipping local comparison")
+        return "inconclusive", 0.0
+
+    scores = {}
+
+    if closed_ref is not None:
+        scores["closed"] = compute_ssim(gate_gray, closed_ref)
+        log("opencv", f"SSIM closed_{suffix}: {scores['closed']:.3f}")
+
+    if open_ref is not None:
+        scores["open"] = compute_ssim(gate_gray, open_ref)
+        log("opencv", f"SSIM open_{suffix}: {scores['open']:.3f}")
+
+    best_status = max(scores, key=scores.get)
+    best_score = scores[best_status]
+
+    if best_score >= SSIM_THRESHOLD:
+        log("opencv", f"Local match: {best_status} (SSIM {best_score:.3f} >= {SSIM_THRESHOLD})")
+        return best_status, best_score
+
+    log("opencv", f"Local inconclusive (best: {best_status} at {best_score:.3f} < {SSIM_THRESHOLD})")
+    return "inconclusive", best_score
+
+
+def _parse_model_version(name: str) -> tuple[float, int, int]:
+    """Extract sorting key from model name: (version, type_rank, stability_rank).
+
+    Higher version = better. Flash preferred over Pro (lower type_rank).
+    Stable preferred over preview (lower stability_rank).
+    """
+    # Extract version number (e.g., "gemini-3-flash" -> 3, "gemini-2.5-pro" -> 2.5)
+    version_match = re.search(r'gemini-(\d+(?:\.\d+)?)', name)
+    version = float(version_match.group(1)) if version_match else 0.0
+
+    # Flash preferred over Pro for free tier limits
+    type_rank = 0 if "flash" in name else 1
+
+    # Stable > preview
+    stability_rank = 1 if "preview" in name else 0
+
+    return (version, type_rank, stability_rank)
 
 
 def find_available_models(client: genai.Client) -> list[str]:
-    """List available models and return them ranked by preference (best first)."""
+    """List available models and return them sorted by version descending.
+
+    Filters out models unsuitable for vision (tts, lite, thinking, etc).
+    """
     log("models", "Listing available Gemini models...")
 
     available_models = []
@@ -156,32 +288,30 @@ def find_available_models(client: genai.Client) -> list[str]:
 
             if "gemini" in model_name.lower():
                 available_models.append(model_name)
-                log("models", f"  Found: {model_name}")
     except Exception as e:
         log("models", f"ERROR listing models: {e}")
         return []
 
-    # Build ranked list from preference order
-    ranked = []
-    seen = set()
-    for preferred in PREFERRED_MODELS:
-        for available in available_models:
-            if available not in seen and (available.startswith(preferred) or available == preferred):
-                ranked.append(available)
-                seen.add(available)
+    log("models", f"Found {len(available_models)} Gemini models from API")
 
-    # Append any remaining gemini models not in our preference list
-    for available in available_models:
-        if available not in seen:
-            ranked.append(available)
-            seen.add(available)
+    # Filter out models unsuitable for vision tasks
+    filtered = []
+    for name in available_models:
+        lower = name.lower()
+        if any(lower.endswith(suffix) or suffix + "-" in lower for suffix in EXCLUDED_MODEL_SUFFIXES):
+            log("models", f"  Excluded (not vision): {name}")
+            continue
+        filtered.append(name)
 
-    if ranked:
-        log("models", f"Ranked models: {', '.join(ranked)}")
+    # Sort: highest version first, then flash before pro, then stable before preview
+    filtered.sort(key=lambda n: (-_parse_model_version(n)[0], _parse_model_version(n)[1], _parse_model_version(n)[2]))
+
+    if filtered:
+        log("models", f"Ranked models ({len(filtered)}): {', '.join(filtered[:5])}...")
     else:
-        log("models", "ERROR: No Gemini models found!")
+        log("models", "ERROR: No suitable Gemini models found!")
 
-    return ranked
+    return filtered
 
 
 def capture_rtsp_frame(rtsp_url: str) -> tuple[bytes, bytes] | tuple[None, None]:
