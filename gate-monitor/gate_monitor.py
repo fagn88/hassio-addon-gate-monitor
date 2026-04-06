@@ -24,7 +24,7 @@ SNAPSHOT_DIR = Path("/config/www/gate-monitor")
 REFERENCE_DIR = Path("/config/www/gate-monitor/reference")
 
 # Model variants unsuitable for vision tasks
-EXCLUDED_MODEL_SUFFIXES = ["-tts", "-lite", "-thinking", "-search"]
+EXCLUDED_MODEL_SUFFIXES = ["-tts", "-lite", "-thinking", "-search", "-live", "-image", "-customtools", "-audio", "-embedding", "-robotics", "-computer-use"]
 
 # Minimum Gemini model version to use (lower versions give unreliable results)
 MIN_MODEL_VERSION = 3.0
@@ -507,8 +507,9 @@ def analyze_gate(
             error_str = str(e)
             is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
             is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "504" in error_str or "Gateway Time-out" in error_str
-            if is_rate_limit or is_transient:
-                reason = "Rate limited" if is_rate_limit else "Service unavailable"
+            is_not_found = "404" in error_str or "NOT_FOUND" in error_str
+            if is_rate_limit or is_transient or is_not_found:
+                reason = "Rate limited" if is_rate_limit else "Not found" if is_not_found else "Service unavailable"
                 remaining = len(models) - models.index(model_name) - 1
                 log("vision", f"{reason}: {model_name}. {remaining} fallback(s) remaining.")
             else:

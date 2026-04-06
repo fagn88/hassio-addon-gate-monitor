@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1] - 2026-04-06
+
+### Fixed
+- Exclude non-generateContent models: `-live`, `-image`, `-customtools`, `-audio`, `-embedding`, `-robotics`, `-computer-use`
+- 404 NOT_FOUND errors now continue to next model instead of aborting the cascade
+
 ## [1.3.0] - 2026-04-06
 
 ### Added
