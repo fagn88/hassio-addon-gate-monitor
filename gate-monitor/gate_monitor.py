@@ -274,7 +274,7 @@ def _parse_model_version(name: str) -> tuple[float, int, int]:
 def find_available_models(client: genai.Client) -> list[str]:
     """List available models and return them sorted by version descending.
 
-    Filters out models unsuitable for vision (tts, lite, thinking, etc).
+    Filters out models unsuitable for vision and below MIN_MODEL_VERSION.
     """
     log("models", "Listing available Gemini models...")
 
@@ -282,7 +282,6 @@ def find_available_models(client: genai.Client) -> list[str]:
     try:
         for model in client.models.list():
             model_name = model.name
-            # Strip "models/" prefix if present
             if model_name.startswith("models/"):
                 model_name = model_name[7:]
 
@@ -301,15 +300,23 @@ def find_available_models(client: genai.Client) -> list[str]:
         if any(lower.endswith(suffix) or suffix + "-" in lower for suffix in EXCLUDED_MODEL_SUFFIXES):
             log("models", f"  Excluded (not vision): {name}")
             continue
+
+        # Enforce minimum version
+        version_match = re.search(r'gemini-(\d+(?:\.\d+)?)', name)
+        version = float(version_match.group(1)) if version_match else 0.0
+        if version < MIN_MODEL_VERSION:
+            log("models", f"  Excluded (v{version} < {MIN_MODEL_VERSION}): {name}")
+            continue
+
         filtered.append(name)
 
     # Sort: highest version first, then flash before pro, then stable before preview
     filtered.sort(key=lambda n: (-_parse_model_version(n)[0], _parse_model_version(n)[1], _parse_model_version(n)[2]))
 
     if filtered:
-        log("models", f"Ranked models ({len(filtered)}): {', '.join(filtered[:5])}...")
+        log("models", f"Ranked 3.x+ models ({len(filtered)}): {', '.join(filtered[:5])}{'...' if len(filtered) > 5 else ''}")
     else:
-        log("models", "ERROR: No suitable Gemini models found!")
+        log("models", "WARNING: No Gemini 3.x+ models found! Will rely on local comparison only.")
 
     return filtered
 
@@ -456,61 +463,59 @@ def analyze_gate(
     image_data: bytes,
     reference_images: list,
     confidence_threshold: int,
-    retries_per_model: int = 2,
 ) -> tuple[str, int, str]:
-    """Send image to Gemini Vision and get gate status, cascading through models on failure.
+    """Send image to Gemini Vision 3.x and get gate status.
+
+    Only tries 3.x models. Returns 'unavailable' if all are rate-limited
+    rather than falling back to weaker models.
 
     Returns:
-        Tuple of (status, confidence, model_used) where status is 'open'/'closed'/'unknown'/'error'
+        Tuple of (status, confidence, model_used)
+        status: 'open'/'closed'/'unknown'/'unavailable'
     """
-    # Convert bytes to PIL Image for Gemini
-    query_image = Image.open(io.BytesIO(image_data))
+    if not models:
+        log("vision", "No Gemini 3.x models available, skipping API check")
+        return "unavailable", 0, ""
 
-    # Build contents with reference images
+    query_image = Image.open(io.BytesIO(image_data))
     contents = build_contents(reference_images, query_image)
 
-    for model_idx, model_name in enumerate(models):
+    for model_name in models:
         log("vision", f"Analyzing image with {model_name}...")
 
-        for attempt in range(retries_per_model):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(temperature=0.0),
-                )
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(temperature=0.0),
+            )
 
-                raw = response.text.strip()
-                log("vision", f"Gemini response: {raw}")
+            raw = response.text.strip()
+            log("vision", f"Gemini response: {raw}")
 
-                status, confidence = parse_gate_response(raw)
-                log("vision", f"Parsed: status={status}, confidence={confidence}")
+            status, confidence = parse_gate_response(raw)
+            log("vision", f"Parsed: status={status}, confidence={confidence}")
 
-                if confidence < confidence_threshold:
-                    log("vision", f"Confidence {confidence} below threshold {confidence_threshold}, treating as unknown")
-                    return "unknown", confidence, model_name
+            if confidence < confidence_threshold:
+                log("vision", f"Confidence {confidence} below threshold {confidence_threshold}, treating as unknown")
+                return "unknown", confidence, model_name
 
-                return status, confidence, model_name
+            return status, confidence, model_name
 
-            except Exception as e:
-                error_str = str(e)
-                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-                is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "504" in error_str or "Gateway Time-out" in error_str
-                if is_rate_limit or is_transient:
-                    if attempt < retries_per_model - 1:
-                        wait_time = 30 * (attempt + 1)
-                        reason = "Rate limited" if is_rate_limit else "Service unavailable"
-                        log("vision", f"{reason}. Waiting {wait_time}s before retry {attempt + 1}/{retries_per_model}...")
-                        time.sleep(wait_time)
-                    else:
-                        remaining = len(models) - model_idx - 1
-                        log("vision", f"{model_name} unavailable after {retries_per_model} attempts. {remaining} fallback model(s) remaining.")
-                else:
-                    log("vision", f"ERROR: {model_name} failed: {e}")
-                    break  # Non-transient error, skip to next model
+        except Exception as e:
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "504" in error_str or "Gateway Time-out" in error_str
+            if is_rate_limit or is_transient:
+                reason = "Rate limited" if is_rate_limit else "Service unavailable"
+                remaining = len(models) - models.index(model_name) - 1
+                log("vision", f"{reason}: {model_name}. {remaining} fallback(s) remaining.")
+            else:
+                log("vision", f"ERROR: {model_name} failed: {e}")
+                break
 
-    log("vision", "ERROR: All models exhausted, no successful response")
-    return "error", 0, ""
+    log("vision", "All 3.x models unavailable, returning safely")
+    return "unavailable", 0, ""
 
 
 def create_mqtt_client(config: dict) -> mqtt.Client:
@@ -630,7 +635,7 @@ def main() -> None:
                     reference_images, confidence_threshold,
                 )
 
-                if status != "error":
+                if status != "unavailable":
                     # If gate detected as OPEN, do immediate confirmation (best of 3)
                     if status == "open":
                         log("main", f"[1/3] Gate appears OPEN (confidence: {confidence}%). Confirming immediately...")
