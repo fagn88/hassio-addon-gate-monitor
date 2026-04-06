@@ -19,6 +19,7 @@ import io
 # Enable unbuffered output for real-time logging
 sys.stdout.reconfigure(line_buffering=True)
 
+VERSION = "1.3.2"
 CONFIG_PATH = Path("/data/options.json")
 SNAPSHOT_DIR = Path("/config/www/gate-monitor")
 REFERENCE_DIR = Path("/config/www/gate-monitor/reference")
@@ -576,7 +577,7 @@ def publish_addon_status(client: mqtt.Client, topic_prefix: str, status: str) ->
 
 def main() -> None:
     """Main entry point."""
-    log("main", "Gate Monitor v1.3.0 starting (hybrid OpenCV + Gemini 3.x)...")
+    log("main", f"Gate Monitor v{VERSION} starting (hybrid OpenCV + Gemini 3.x)...")
 
     config = load_config()
 
