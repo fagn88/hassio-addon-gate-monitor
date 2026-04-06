@@ -19,7 +19,7 @@ import io
 # Enable unbuffered output for real-time logging
 sys.stdout.reconfigure(line_buffering=True)
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 CONFIG_PATH = Path("/data/options.json")
 SNAPSHOT_DIR = Path("/config/www/gate-monitor")
 REFERENCE_DIR = Path("/config/www/gate-monitor/reference")
@@ -315,8 +315,8 @@ def find_available_models(client: genai.Client) -> list[str]:
 
         filtered.append(name)
 
-    # Sort: highest version first, then flash before pro, then stable before preview
-    filtered.sort(key=lambda n: (-_parse_model_version(n)[0], _parse_model_version(n)[1], _parse_model_version(n)[2]))
+    # Sort: flash before pro (free tier), then highest version, then stable before preview
+    filtered.sort(key=lambda n: (_parse_model_version(n)[1], -_parse_model_version(n)[0], _parse_model_version(n)[2]))
 
     if filtered:
         log("models", f"Ranked 3.x+ models ({len(filtered)}): {', '.join(filtered[:5])}{'...' if len(filtered) > 5 else ''}")
